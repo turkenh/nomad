@@ -91,12 +91,8 @@ func createExecutorWithConfig(config *plugin.ClientConfig, w io.Writer) (executo
 
 func consulContext(clientConfig *config.Config, containerID string) *executor.ConsulContext {
 	return &executor.ConsulContext{
-		ConsulConfig:   clientConfig.ConsulConfig,
-		ContainerID:    containerID,
-		DockerEndpoint: clientConfig.Read("docker.endpoint"),
-		TLSCa:          clientConfig.Read("docker.tls.ca"),
-		TLSCert:        clientConfig.Read("docker.tls.cert"),
-		TLSKey:         clientConfig.Read("docker.tls.key"),
+		ConsulConfig: clientConfig.ConsulConfig,
+		ContainerID:  containerID,
 	}
 }
 
