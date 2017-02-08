@@ -87,12 +87,21 @@ type consulCheckID string
 // ServiceID
 type ServiceKey string
 
-// ServiceDomain is the domain of services registered by Nomad
+// ServiceDomain is the domain of services registered by Nomad. It is either
+// Client, Server, or task specific (see NewExecutorDomain).
 type ServiceDomain string
 
 const (
 	ClientDomain ServiceDomain = "client"
 	ServerDomain ServiceDomain = "server"
+)
+
+var (
+	// defaultDelegateChecks are the default check types that are handled
+	// by Nomad instead of Consul.
+	defaultDelegateChecks = map[string]struct{}{
+		"script": struct{}{},
+	}
 )
 
 // NewExecutorDomain returns a domain specific to the alloc ID and task
@@ -123,8 +132,9 @@ type Syncer struct {
 
 	addrFinder           func(portLabel string) (string, int)
 	createDelegatedCheck func(*structs.ServiceCheck, string) (Check, error)
-	delegateChecks       map[string]struct{} // delegateChecks are the checks that the Nomad client runs and reports to Consul
 	// End registryLock guarded attributes.
+
+	delegateChecks map[string]struct{} // delegateChecks are the checks that the Nomad client runs and reports to Consul
 
 	logger *log.Logger
 
@@ -173,6 +183,7 @@ func NewSyncer(consulConfig *config.ConsulConfig, shutdownCh chan struct{}, logg
 		servicesGroups:    make(map[ServiceDomain]map[ServiceKey]*consul.AgentServiceRegistration),
 		checkGroups:       make(map[ServiceDomain]map[ServiceKey][]*consul.AgentCheckRegistration),
 		checkRunners:      make(map[consulCheckID]*CheckRunner),
+		delegateChecks:    defaultDelegateChecks,
 		periodicCallbacks: make(map[string]types.PeriodicCallback),
 		notifySyncCh:      make(chan struct{}, 1),
 		// default noop implementation of addrFinder
@@ -182,14 +193,6 @@ func NewSyncer(consulConfig *config.ConsulConfig, shutdownCh chan struct{}, logg
 	}
 
 	return &consulSyncer, nil
-}
-
-// SetDelegatedChecks sets the checks that nomad is going to run and report the
-// result back to consul
-func (c *Syncer) SetDelegatedChecks(delegateChecks map[string]struct{}, createDelegatedCheckFn func(*structs.ServiceCheck, string) (Check, error)) *Syncer {
-	c.delegateChecks = delegateChecks
-	c.createDelegatedCheck = createDelegatedCheckFn
-	return c
 }
 
 // SetAddrFinder sets a function to find the host and port for a Service given its port label

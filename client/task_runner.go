@@ -1202,7 +1202,31 @@ func (r *TaskRunner) startTask() error {
 	r.handleLock.Lock()
 	r.handle = handle
 	r.handleLock.Unlock()
+
+	//TODO handle errors?!
+	r.registerConsul(drv)
+
 	return nil
+}
+
+// registerConsul registers this task's services and checks with Consul.
+func (r *TaskRunner) registerConsul(drv driver.Driver) error {
+	domain := fmt.Sprintf("executor-%s-%s", r.alloc.ID, r.task.Name)
+services []*api.AgentServiceRegistration, checks []*api.AgentServiceCheck
+	srv := consul.AgentServiceRegistration{
+		ID:   string(generateConsulServiceID(domain, key)),
+		Name: service.Name,
+		Tags: service.Tags,
+	}
+	host, port := c.addrFinder(service.PortLabel)
+	if host != "" {
+		srv.Address = host
+	}
+
+	if port != 0 {
+		srv.Port = port
+	}
+	return r.consul.AddServices(domain, services, drv)
 }
 
 // buildTaskDir creates the task directory before driver.Prestart. It is safe

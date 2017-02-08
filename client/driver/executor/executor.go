@@ -663,15 +663,6 @@ func (e *UniversalExecutor) listenerUnix() (net.Listener, error) {
 	return net.Listen("unix", path)
 }
 
-// createCheckMap creates a map of checks that the executor will handle on it's
-// own
-func (e *UniversalExecutor) createCheckMap() map[string]struct{} {
-	checks := map[string]struct{}{
-		"script": struct{}{},
-	}
-	return checks
-}
-
 // createCheck creates NomadCheck from a ServiceCheck
 func (e *UniversalExecutor) createCheck(check *structs.ServiceCheck, checkID string) (consul.Check, error) {
 	if check.Type == structs.ServiceCheckScript && e.ctx.Driver == "docker" {
