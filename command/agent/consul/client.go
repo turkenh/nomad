@@ -15,6 +15,8 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
+const mark = struct{}{}
+
 type Executor interface {
 	Exec(ctx context.Context, cmd string, args []string) error
 }
@@ -72,9 +74,12 @@ DISCO:
 	}
 }
 
+// RegisterTask with Consul. Adds all sevice entries and checks to Consul.
+//
+// Actual communication with Consul is done asynchrously (see Run).
 func (c *Client) RegisterTask(allocID string, task *structs.Task, exec Executor) {
 	regs := make([]*api.AgentServiceRegistration, len(task.Services))
-	checks := make([]*api.AgentServiceCheck, 0, len(task.Services)) // just guess at size
+	checks := make([]*api.AgentServiceCheck, 0, len(task.Services)*2) // just guess at size
 
 	for i, service := range task.Services {
 		id := makeServiceKey(allocID, task.Name, service.Name)
@@ -103,10 +108,35 @@ func (c *Client) RegisterTask(allocID string, task *structs.Task, exec Executor)
 	}
 
 	// Now add them to the registration fields
-	c.prepareRegistrations(regs, checks)
+	c.enqueueRegs(regs, checks)
 }
 
-func (c *Client) prepareRegistrations(regs []*api.AgentServiceRegistration, checks []*api.AgentServiceCheck) {
+// DeregisterTask from Consul. Removes all service entries and checks.
+//
+// Actual communication with Consul is done asynchrously (see Run).
+func (c *Client) RemoveTask(allocID string, task *structs.Task) {
+	deregs := make([]string, len(task.Services))
+	checks := make([]string, 0, len(task.Services)*2) // just guess at size
+
+	for i, service := range task.Services {
+		id := makeServiceKey(allocID, task.Name, service.Name)
+		deregs = append(deregs, id)
+
+		for _, check := range service.Checks {
+			if check.Type == structs.ServiceCheckScript {
+				//TODO stop async check
+				c.stopCheck(check)
+				continue
+			}
+			checks = append(checks, check)
+		}
+	}
+
+	// Now add them to the deregistration fields; main Run loop will update
+	c.enqueueDeregs(deregs, checks)
+}
+
+func (c *Client) enqueueRegs(regs []*api.AgentServiceRegistration, checks []*api.AgentServiceCheck) {
 	c.regLock.Lock()
 	defer c.regLock.Unlock()
 	for _, reg := range regs {
@@ -120,6 +150,23 @@ func (c *Client) prepareRegistrations(regs []*api.AgentServiceRegistration, chec
 		c.regChecks[check.ID] = check
 		// Make sure it's not being removed
 		delete(c.deregChecks, check.ID)
+	}
+}
+
+func (c *Client) enqueueDeregs(deregs []string, checks []string) {
+	c.regLock.Lock()
+	defer c.regLock.Unlock()
+	for _, dereg := range deregs {
+		// Add dereg
+		c.deregServices[dereg] = mark
+		// Make sure it's not being added
+		delete(c.regServices, dereg)
+	}
+	for _, check := range checks {
+		// Add check for removal
+		c.deregChecks[check] = mark
+		// Make sure it's not being added
+		delete(c.regChecks, check)
 	}
 }
 
