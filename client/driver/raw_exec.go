@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -248,6 +249,10 @@ func (h *rawExecHandle) Update(task *structs.Task) error {
 
 	// Update is not possible
 	return nil
+}
+
+func (h *rawExecHandle) Exec(ctx context.Context, cmd string, args []string) ([]byte, int, error) {
+	return execChroot(ctx, "", cmd, args)
 }
 
 func (h *rawExecHandle) Signal(s os.Signal) error {

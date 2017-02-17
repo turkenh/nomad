@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/armon/circbuf"
 	docker "github.com/fsouza/go-dockerclient"
 
 	"github.com/docker/docker/cli/config/configfile"
@@ -1254,6 +1256,42 @@ func (h *DockerHandle) Update(task *structs.Task) error {
 
 	// Update is not possible
 	return nil
+}
+
+func (h *DockerHandle) Exec(ctx context.Context, cmd string, args []string) ([]byte, int, error) {
+	fullCmd := make([]string, len(args)+1)
+	fullCmd[0] = cmd
+	copy(fullCmd[1:], args)
+	createExecOpts := docker.CreateExecOptions{
+		AttachStdin:  false,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          false,
+		Cmd:          fullCmd,
+		Container:    h.containerID,
+		Context:      ctx,
+	}
+	exec, err := h.client.CreateExec(createExecOpts)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	output, _ := circbuf.NewBuffer(int64(dstructs.CheckBufSize))
+	startOpts := docker.StartExecOptions{
+		Detach:       false,
+		Tty:          false,
+		OutputStream: output,
+		ErrorStream:  output,
+		Context:      ctx,
+	}
+	if err := client.StartExec(exec.ID, startOpts); err != nil {
+		return nil, 0, err
+	}
+	res, err := client.InspectExec(exec.ID)
+	if err != nil {
+		return output.Bytes(), 0, err
+	}
+	return output.Bytes(), res.ExitCode, nil
 }
 
 func (h *DockerHandle) Signal(s os.Signal) error {

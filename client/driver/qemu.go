@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -358,6 +359,10 @@ func (h *qemuHandle) Update(task *structs.Task) error {
 
 	// Update is not possible
 	return nil
+}
+
+func (h *qemuHandle) Exec(ctx context.Context, cmd string, args []string) ([]byte, int, error) {
+	return execChroot(ctx, "", cmd, args)
 }
 
 func (h *qemuHandle) Signal(s os.Signal) error {

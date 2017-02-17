@@ -2,6 +2,7 @@ package driver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -524,6 +525,10 @@ func (h *rktHandle) Update(task *structs.Task) error {
 
 	// Update is not possible
 	return nil
+}
+
+func (h *rktHandle) Exec(ctx context.Context, cmd string, args []string) ([]byte, int, error) {
+	//TODO run rkt enter --app="container" cmd args...
 }
 
 func (h *rktHandle) Signal(s os.Signal) error {

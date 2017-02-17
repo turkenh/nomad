@@ -693,6 +693,15 @@ func (e *UniversalExecutor) createCheck(check *structs.ServiceCheck, checkID str
 	return nil, fmt.Errorf("couldn't create check for %v", check.Name)
 }
 
+// createCheckMap creates a map of checks that the executor will handle on it's
+// own
+func (e *UniversalExecutor) createCheckMap() map[string]struct{} {
+	checks := map[string]struct{}{
+		"script": struct{}{},
+	}
+	return checks
+}
+
 // interpolateServices interpolates tags in a service and checks with values from the
 // task's environment.
 func (e *UniversalExecutor) interpolateServices(task *structs.Task) {

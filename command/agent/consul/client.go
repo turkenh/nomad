@@ -3,6 +3,7 @@ package consul
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"strconv"
@@ -12,16 +13,21 @@ import (
 
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/nomad/structs/config"
 )
 
 var mark = struct{}{}
 
+//TODO rename?!
 type Executor interface {
-	Exec(ctx context.Context, cmd string, args []string) error
+	Exec(ctx context.Context, cmd string, args []string) ([]byte, int, error)
 }
 
+//TODO rename?!
 type Client struct {
+	//TODO switch to interface for testing
 	client        *api.Client
+	logger        *log.Logger
 	retryInterval time.Duration
 	syncInterval  time.Duration
 
@@ -36,38 +42,54 @@ type Client struct {
 	deregServices map[string]struct{}
 	deregChecks   map[string]struct{}
 
+	// scriptChecks currently running and their cancel func
+	scriptChecks map[string]func()
+
 	// regLock must be held while accessing reg and dereg maps
 	regLock sync.Mutex
+}
+
+func NewClient(consulConfig *config.ConsulConfig, shutdownCh chan struct{}, logger *log.Logger) (*Client, error) {
+	apiConf, err := consulConfig.ApiConfig()
+	if err != nil {
+		return nil, err
+	}
+	client, err := api.NewClient(apiConf)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{
+		client:        client,
+		logger:        logger,
+		retryInterval: defaultSyncInterval, //TODO what should this default to?!
+		syncInterval:  defaultSyncInterval,
+		shutdownCh:    shutdownCh,
+		syncCh:        make(chan struct{}, 1),
+		regServices:   make(map[string]*api.AgentServiceRegistration),
+		regChecks:     make(map[string]*api.AgentCheckRegistration),
+		deregServices: make(map[string]struct{}),
+		deregChecks:   make(map[string]struct{}),
+		scriptChecks:  make(map[string]func()),
+	}, nil
 }
 
 func (c *Client) Run() {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
-DISCO:
-	for {
-		select {
-		case <-c.shutdownCh:
-			return
-		case <-timer.C:
-			if ok := c.connect(); ok {
-				break DISCO
-			}
-			timer.Reset(c.retryInterval)
-		}
-	}
+	// Drain the initial tick so we don't sync until instructed
+	<-timer.C
 
-	timer.Reset(0)
 	for {
 		select {
 		case <-c.syncCh:
 			timer.Reset(0)
 		case <-timer.C:
 			if err := c.sync(); err != nil {
+				//TODO Log and jitter/backoff
 				timer.Reset(c.retryInterval)
 				continue
 			}
-			timer.Reset(c.syncInterval)
 		case <-c.shutdownCh:
 			return
 		}
@@ -182,6 +204,7 @@ ERROR:
 func (c *Client) RegisterTask(allocID string, task *structs.Task, exec Executor) error {
 	regs := make([]*api.AgentServiceRegistration, len(task.Services))
 	checks := make([]*api.AgentCheckRegistration, 0, len(task.Services)*2) // just guess at size
+	scriptChecks := map[string]*scriptCheck{}
 
 	for i, service := range task.Services {
 		id := makeServiceKey(allocID, task.Name, service)
@@ -196,16 +219,15 @@ func (c *Client) RegisterTask(allocID string, task *structs.Task, exec Executor)
 		regs[i] = serviceReg
 
 		for _, check := range service.Checks {
+			checkID := createCheckID(id, check)
 			if check.Type == structs.ServiceCheckScript {
-				//TODO async start check
-				c.startCheck(check, exec)
-				continue
+				scriptChecks[checkID] = newScriptCheck(checkID, check, exec, c.client.Agent(), c.logger, c.shutdownCh)
 			}
 			host, port := serviceReg.Address, serviceReg.Port
 			if check.PortLabel != "" {
 				host, port = task.FindHostAndPortFor(check.PortLabel)
 			}
-			checkReg, err := createCheckReg(id, check, host, port)
+			checkReg, err := createCheckReg(id, checkID, check, host, port)
 			if err != nil {
 				return fmt.Errorf("failed to add check %q: %v", check.Name, err)
 			}
@@ -215,7 +237,7 @@ func (c *Client) RegisterTask(allocID string, task *structs.Task, exec Executor)
 	}
 
 	// Now add them to the registration fields
-	c.enqueueRegs(regs, checks)
+	c.enqueueRegs(regs, checks, scriptChecks)
 	return nil
 }
 
@@ -228,15 +250,23 @@ func (c *Client) RemoveTask(allocID string, task *structs.Task) {
 
 	for i, service := range task.Services {
 		id := makeServiceKey(allocID, task.Name, service)
-		deregs = append(deregs, id)
+		deregs[i] = id
 
 		for _, check := range service.Checks {
+			checkID := createCheckID(id, check)
 			if check.Type == structs.ServiceCheckScript {
-				//TODO stop async check
-				c.stopCheck(check)
+				// Unlike registeration, deregistration can't
+				// be interrupted due to errors so we can
+				// cancel script checks as we go instead of
+				// doing it when deregs are enqueued
+				c.regLock.Lock()
+				if cancel, ok := c.scriptChecks[checkID]; ok {
+					cancel()
+				}
+				c.regLock.Unlock()
 				continue
 			}
-			checks = append(checks, createCheckID(check, id))
+			checks = append(checks, checkID)
 		}
 	}
 
@@ -244,7 +274,7 @@ func (c *Client) RemoveTask(allocID string, task *structs.Task) {
 	c.enqueueDeregs(deregs, checks)
 }
 
-func (c *Client) enqueueRegs(regs []*api.AgentServiceRegistration, checks []*api.AgentCheckRegistration) {
+func (c *Client) enqueueRegs(regs []*api.AgentServiceRegistration, checks []*api.AgentCheckRegistration, scriptChecks map[string]*scriptCheck) {
 	c.regLock.Lock()
 	defer c.regLock.Unlock()
 	for _, reg := range regs {
@@ -258,6 +288,10 @@ func (c *Client) enqueueRegs(regs []*api.AgentServiceRegistration, checks []*api
 		c.regChecks[check.ID] = check
 		// Make sure it's not being removed
 		delete(c.deregChecks, check.ID)
+	}
+	// Start script checks and retain their cancel funcs
+	for checkID, check := range scriptChecks {
+		c.scriptChecks[checkID] = check.run()
 	}
 }
 
@@ -278,8 +312,13 @@ func (c *Client) enqueueDeregs(deregs []string, checks []string) {
 	}
 }
 
-func (c *Client) startCheck(check *structs.ServiceCheck, exec Executor) {
-	panic("TODO - run sevice check script in a goroutine")
+func (c *Client) hasShutdown() bool {
+	select {
+	case <-c.shutdownCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // makeServiceKey creates a unique ID for identifying a service in Consul.
@@ -300,7 +339,8 @@ func makeServiceKey(allocID, taskName string, service *structs.Service) string {
 	return strings.Join(parts, "-")
 }
 
-func createCheckID(check *structs.ServiceCheck, serviceID string) string {
+// createCheckID creates a unique ID for a check.
+func createCheckID(serviceID string, check *structs.ServiceCheck) string {
 	return check.Hash(serviceID)
 }
 
@@ -308,9 +348,9 @@ func createCheckID(check *structs.ServiceCheck, serviceID string) string {
 //
 // Only supports HTTP(S) and TCP checks. Script checks must be handled
 // externally.
-func createCheckReg(serviceID string, check *structs.ServiceCheck, host string, port int) (*api.AgentCheckRegistration, error) {
+func createCheckReg(serviceID, checkID string, check *structs.ServiceCheck, host string, port int) (*api.AgentCheckRegistration, error) {
 	chkReg := api.AgentCheckRegistration{
-		ID:        createCheckID(check, serviceID),
+		ID:        checkID,
 		Name:      check.Name,
 		ServiceID: serviceID,
 	}
@@ -336,7 +376,7 @@ func createCheckReg(serviceID string, check *structs.ServiceCheck, host string, 
 	case structs.ServiceCheckTCP:
 		chkReg.TCP = net.JoinHostPort(host, strconv.Itoa(port))
 	case structs.ServiceCheckScript:
-		panic("TODO - handle outside this function")
+		chkReg.TTL = (check.Interval + ttlCheckBuffer).String()
 	default:
 		return nil, fmt.Errorf("check type %+q not valid", check.Type)
 	}
