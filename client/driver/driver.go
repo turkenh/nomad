@@ -1,7 +1,6 @@
 package driver
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -244,9 +243,6 @@ type DriverHandle interface {
 	// Update is used to update the task if possible and update task related
 	// configurations.
 	Update(task *structs.Task) error
-
-	// Execute a command within the handle's context.
-	Exec(ctx context.Context, cmd string, args []string) (output []byte, code int, err error)
 
 	// Kill is used to stop the task
 	Kill() error

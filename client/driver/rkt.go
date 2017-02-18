@@ -3,8 +3,11 @@ package driver
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -82,6 +85,7 @@ type RktDriverConfig struct {
 
 // rktHandle is returned from Start/Open as a handle to the PID
 type rktHandle struct {
+	uuid           string
 	pluginClient   *plugin.Client
 	executorPid    int
 	executor       executor.Executor
@@ -95,6 +99,7 @@ type rktHandle struct {
 // rktPID is a struct to map the pid running the process to the vm image on
 // disk
 type rktPID struct {
+	UUID           string
 	PluginConfig   *PluginReattachConfig
 	ExecutorPid    int
 	KillTimeout    time.Duration
@@ -230,7 +235,16 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 	img := driverConfig.ImageName
 
 	// Build the command.
-	var cmdArgs []string
+	cmdArgs := make([]string, 0, 32)
+
+	// Write the UUID out to a file in the state dir so we can read it back
+	// in and access the pod by UUID from other commands
+	//TODO factor out of task_runner.go
+	hashVal := md5.Sum([]byte(task.Name))
+	hashHex := hex.EncodeToString(hashVal[:])
+	dirName := fmt.Sprintf("task-%s", hashHex)
+	uuidPath := filepath.Join(d.config.StateDir, "alloc", ctx.AllocID, dirName, "rkt.uuid")
+	cmdArgs = append(cmdArgs, fmt.Sprintf("--uuid-file-save=%s", uuidPath))
 
 	// Add debug option to rkt command.
 	debug := driverConfig.Debug
@@ -438,9 +452,17 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		return nil, err
 	}
 
-	d.logger.Printf("[DEBUG] driver.rkt: started ACI %q with: %v", img, cmdArgs)
+	uuid := ""
+	if uuidBytes, err := ioutil.ReadFile(uuidPath); err != nil {
+		d.logger.Print("[WARN] driver.rkt: reading uuid from %q failed; unable to run script checks. Error: %v", uuidPath, err)
+	} else {
+		uuid = string(uuidBytes)
+	}
+
+	d.logger.Printf("[DEBUG] driver.rkt: started ACI %q (UUID: %s) with: %v", img, uuid, cmdArgs)
 	maxKill := d.DriverContext.config.MaxKillTimeout
 	h := &rktHandle{
+		uuid:           uuid,
 		pluginClient:   pluginClient,
 		executor:       execIntf,
 		executorPid:    ps.Pid,
@@ -502,6 +524,7 @@ func (d *RktDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error
 func (h *rktHandle) ID() string {
 	// Return a handle to the PID
 	pid := &rktPID{
+		UUID:           h.uuid,
 		PluginConfig:   NewPluginReattachConfig(h.pluginClient.ReattachConfig()),
 		KillTimeout:    h.killTimeout,
 		MaxKillTimeout: h.maxKillTimeout,
@@ -528,7 +551,15 @@ func (h *rktHandle) Update(task *structs.Task) error {
 }
 
 func (h *rktHandle) Exec(ctx context.Context, cmd string, args []string) ([]byte, int, error) {
-	//TODO run rkt enter --app="container" cmd args...
+	if h.uuid == "" {
+		return nil, 0, fmt.Errorf("unable to find rkt pod UUID")
+	}
+	// enter + UUID + cmd + args...
+	enterArgs := make([]string, 3+len(args))
+	enterArgs[0] = "enter"
+	enterArgs[1] = h.uuid
+	copy(enterArgs[2:], args)
+	return execChroot(ctx, "", rktCmd, enterArgs)
 }
 
 func (h *rktHandle) Signal(s os.Signal) error {

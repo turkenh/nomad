@@ -184,11 +184,9 @@ func getExecutorUser(task *structs.Task) string {
 // execChroot executes cmd with args inside chroot if set and returns the
 // output, exit code, and error. If chroot is an empty string the command is
 // executed on the host.
-//
-// It is meant for use by the exec and java driver handles.
-func execChroot(ctx context.Context, chroot, cmd string, args []string) ([]byte, int, error) {
+func execChroot(ctx context.Context, chroot, name string, args []string) ([]byte, int, error) {
 	buf, _ := circbuf.NewBuffer(int64(cstructs.CheckBufSize))
-	cmd := exec.CommandContext(ctx, cmd, args...)
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = "/"
 	cmd.Stdout = buf
 	cmd.Stderr = buf

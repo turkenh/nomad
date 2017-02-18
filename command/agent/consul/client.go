@@ -19,7 +19,7 @@ import (
 var mark = struct{}{}
 
 //TODO rename?!
-type Executor interface {
+type ScriptExecutor interface {
 	Exec(ctx context.Context, cmd string, args []string) ([]byte, int, error)
 }
 
@@ -198,10 +198,11 @@ ERROR:
 	return err
 }
 
-// RegisterTask with Consul. Adds all sevice entries and checks to Consul.
+// RegisterTask with Consul. Adds all sevice entries and checks to Consul. If
+// exec is nil and a script check exists an error is returned.
 //
 // Actual communication with Consul is done asynchrously (see Run).
-func (c *Client) RegisterTask(allocID string, task *structs.Task, exec Executor) error {
+func (c *Client) RegisterTask(allocID string, task *structs.Task, exec ScriptExecutor) error {
 	regs := make([]*api.AgentServiceRegistration, len(task.Services))
 	checks := make([]*api.AgentCheckRegistration, 0, len(task.Services)*2) // just guess at size
 	scriptChecks := map[string]*scriptCheck{}
@@ -221,6 +222,9 @@ func (c *Client) RegisterTask(allocID string, task *structs.Task, exec Executor)
 		for _, check := range service.Checks {
 			checkID := createCheckID(id, check)
 			if check.Type == structs.ServiceCheckScript {
+				if exec == nil {
+					return fmt.Errorf("driver %q doesn't support script checks", task.Driver)
+				}
 				scriptChecks[checkID] = newScriptCheck(checkID, check, exec, c.client.Agent(), c.logger, c.shutdownCh)
 			}
 			host, port := serviceReg.Address, serviceReg.Port

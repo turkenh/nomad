@@ -21,6 +21,7 @@ import (
 	"github.com/hashicorp/nomad/client/driver"
 	"github.com/hashicorp/nomad/client/getter"
 	"github.com/hashicorp/nomad/client/vaultclient"
+	"github.com/hashicorp/nomad/command/agent/consul"
 	"github.com/hashicorp/nomad/nomad/structs"
 
 	"github.com/hashicorp/nomad/client/driver/env"
@@ -61,6 +62,7 @@ type TaskRunner struct {
 	logger         *log.Logger
 	alloc          *structs.Allocation
 	restartTracker *RestartTracker
+	consul         *consul.Client
 
 	// running marks whether the task is running
 	running     bool
@@ -186,6 +188,13 @@ func NewTaskRunner(logger *log.Logger, config *config.Config,
 	}
 	restartTracker := newRestartTracker(tg.RestartPolicy, alloc.Job.Type)
 
+	//TODO This should be injected not created
+	var shutdownCh chan struct{}
+	consulClient, err := consul.NewClient(config.ConsulConfig, shutdownCh, logger)
+	if err != nil {
+		panic(err)
+	}
+
 	tc := &TaskRunner{
 		config:           config,
 		updater:          updater,
@@ -195,6 +204,7 @@ func NewTaskRunner(logger *log.Logger, config *config.Config,
 		task:             task,
 		taskDir:          taskDir,
 		createdResources: driver.NewCreatedResources(),
+		consul:           consulClient,
 		vaultClient:      vaultClient,
 		vaultFuture:      NewTokenFuture().Set(""),
 		updateCh:         make(chan *structs.Allocation, 64),
@@ -1203,30 +1213,17 @@ func (r *TaskRunner) startTask() error {
 	r.handle = handle
 	r.handleLock.Unlock()
 
-	//TODO handle errors?!
-	r.registerConsul(drv)
+	//TODO Add validation so this assertion should never fail
+	// RegisterTask properly handles scriptExec being nil, so it just
+	// ignore the ok value.
+	scriptExec, _ := drv.(consul.ScriptExecutor)
+	if err := r.consul.RegisterTask(r.alloc.ID, r.task, scriptExec); err != nil {
+		//TODO handle errors?!
+		//TODO could break into prepare & submit steps as only preperation can error...
+		r.logger.Printf("[ERR] client: FIXME failed to register task what now %s", err)
+	}
 
 	return nil
-}
-
-// registerConsul registers this task's services and checks with Consul.
-func (r *TaskRunner) registerConsul(drv driver.Driver) error {
-	domain := fmt.Sprintf("executor-%s-%s", r.alloc.ID, r.task.Name)
-services []*api.AgentServiceRegistration, checks []*api.AgentServiceCheck
-	srv := consul.AgentServiceRegistration{
-		ID:   string(generateConsulServiceID(domain, key)),
-		Name: service.Name,
-		Tags: service.Tags,
-	}
-	host, port := c.addrFinder(service.PortLabel)
-	if host != "" {
-		srv.Address = host
-	}
-
-	if port != 0 {
-		srv.Port = port
-	}
-	return r.consul.AddServices(domain, services, drv)
 }
 
 // buildTaskDir creates the task directory before driver.Prestart. It is safe

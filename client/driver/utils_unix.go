@@ -22,5 +22,5 @@ func setChroot(cmd *exec.Cmd, chroot string) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.SysProcAttr.Chroot = e.taskDir
+	cmd.SysProcAttr.Chroot = chroot
 }
