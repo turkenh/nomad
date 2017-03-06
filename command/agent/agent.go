@@ -30,6 +30,10 @@ const (
 	serverRpcCheckTimeout   = 3 * time.Second
 	serverSerfCheckInterval = 10 * time.Second
 	serverSerfCheckTimeout  = 3 * time.Second
+
+	// roles used in identifying Consul entries for Nomad agents
+	consulRoleServer = "server"
+	consulRoleClient = "client"
 )
 
 // Agent is a long running daemon that is used to run both
@@ -42,8 +46,11 @@ type Agent struct {
 	logger    *log.Logger
 	logOutput io.Writer
 
+	//TODO Remove
 	// consulSyncer registers the Nomad agent with the Consul Agent
 	consulSyncer *consul.Syncer
+
+	consul *consul.Client
 
 	client *client.Client
 
@@ -65,6 +72,9 @@ func NewAgent(config *Config, logOutput io.Writer) (*Agent, error) {
 
 	if err := a.setupConsulSyncer(); err != nil {
 		return nil, fmt.Errorf("Failed to initialize Consul syncer task: %v", err)
+	}
+	if err := a.setupConsul(); err != nil {
+		return nil, fmt.Errorf("Failed to initialize Consul client: %v", err)
 	}
 	if err := a.setupServer(); err != nil {
 		return nil, err
@@ -401,14 +411,16 @@ func (a *Agent) setupServer() error {
 
 		// Add the http port check if TLS isn't enabled
 		// TODO Add TLS check when Consul 0.7.1 comes out.
-		consulServices := map[consul.ServiceKey]*structs.Service{
-			consul.GenerateServiceKey(rpcServ):  rpcServ,
-			consul.GenerateServiceKey(serfServ): serfServ,
+		consulServices := []*structs.Service{
+			rpcServ,
+			serfServ,
 		}
 		if !conf.TLSConfig.EnableHTTP {
-			consulServices[consul.GenerateServiceKey(httpServ)] = httpServ
+			consulServices = append(consulServices, httpServ)
 		}
-		a.consulSyncer.SetServices(consul.ServerDomain, consulServices)
+		if err := a.consul.RegisterAgent(consulRoleServer, consulServices); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -491,9 +503,9 @@ func (a *Agent) setupClient() error {
 			},
 		}
 		if !conf.TLSConfig.EnableHTTP {
-			a.consulSyncer.SetServices(consul.ClientDomain, map[consul.ServiceKey]*structs.Service{
-				consul.GenerateServiceKey(httpServ): httpServ,
-			})
+			if err := a.consul.RegisterAgent(consulRoleClient, []*structs.Service{httpServ}); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -696,5 +708,16 @@ func (a *Agent) setupConsulSyncer() error {
 		return host, p
 	})
 
+	return nil
+}
+
+// setupConsul creates the Consul client and starts its main Run loop.
+func (a *Agent) setupConsul() error {
+	client, err := consul.NewClient(a.config.Consul, a.shutdownCh, a.logger)
+	if err != nil {
+		return err
+	}
+	a.consul = client
+	go client.Run()
 	return nil
 }

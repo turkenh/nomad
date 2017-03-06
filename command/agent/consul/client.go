@@ -86,13 +86,20 @@ func (c *Client) Run() {
 			timer.Reset(0)
 		case <-timer.C:
 			if err := c.sync(); err != nil {
+				c.logger.Printf("[WARN] consul: failed to update consul: %v", err)
 				//TODO Log and jitter/backoff
 				timer.Reset(c.retryInterval)
-				continue
 			}
 		case <-c.shutdownCh:
 			return
 		}
+	}
+}
+
+func (c *Client) forceSync() {
+	select {
+	case c.syncCh <- mark:
+	default:
 	}
 }
 
@@ -126,6 +133,8 @@ func (c *Client) sync() error {
 
 	var err error
 
+	regServiceN, regCheckN, deregServiceN, deregCheckN := len(regServices), len(regChecks), len(deregServices), len(deregChecks)
+
 	// Register Services
 	for id, service := range regServices {
 		if err = c.client.Agent().ServiceRegister(service); err != nil {
@@ -157,6 +166,8 @@ func (c *Client) sync() error {
 		}
 		delete(deregChecks, id)
 	}
+
+	c.logger.Printf("[DEBUG] consul: registered %d services / %d checks; deregisterd %d services / %d checks", regServiceN, regCheckN, deregServiceN, deregCheckN)
 	return nil
 
 	//TODO Labels and gotos are nasty; move to a function?
@@ -198,6 +209,73 @@ ERROR:
 	return err
 }
 
+// DiscoverServers tries to discover Nomad servers in a region. The results are
+// ordered with servers in the same datacenter first.
+//
+// If the context is cancelled nil is returned.
+func (c *Client) DiscoverServers(ctx context.Context, region, dc string) <-chan []string {
+	resp := make(chan []string, 1)
+	go func() {
+		panic("TODO - actual server discovery")
+	}()
+	return resp
+}
+
+// RegisterAgent registers Nomad agents (client or server). Script checks are
+// not supported and will return an error. Registration is asynchronous.
+func (c *Client) RegisterAgent(role string, services []*structs.Service) error {
+	regs := make([]*api.AgentServiceRegistration, len(services))
+	checks := make([]*api.AgentCheckRegistration, 0, len(services))
+
+	for i, service := range services {
+		id := makeAgentServiceID(role, service)
+		host, rawport, err := net.SplitHostPort(service.PortLabel)
+		if err != nil {
+			return fmt.Errorf("error parsing port label %q from service %q: %v", service.PortLabel, service.Name, err)
+		}
+		port, err := strconv.Atoi(rawport)
+		if err != nil {
+			return fmt.Errorf("error parsing port %q from service %q: %v", rawport, service.Name, err)
+		}
+		serviceReg := &api.AgentServiceRegistration{
+			ID:      id,
+			Name:    service.Name,
+			Tags:    service.Tags,
+			Address: host,
+			Port:    port,
+		}
+		regs[i] = serviceReg
+
+		for _, check := range service.Checks {
+			checkID := createCheckID(id, check)
+			if check.Type == structs.ServiceCheckScript {
+				return fmt.Errorf("service %q contains invalid check: agent checks do not support scripts", service.Name)
+			}
+			checkHost, checkPort := serviceReg.Address, serviceReg.Port
+			if check.PortLabel != "" {
+				host, rawport, err := net.SplitHostPort(check.PortLabel)
+				if err != nil {
+					return fmt.Errorf("error parsing port label %q from check %q: %v", service.PortLabel, check.Name, err)
+				}
+				port, err := strconv.Atoi(rawport)
+				if err != nil {
+					return fmt.Errorf("error parsing port %q from check %q: %v", rawport, check.Name, err)
+				}
+				checkHost, checkPort = host, port
+			}
+			checkReg, err := createCheckReg(id, checkID, check, checkHost, checkPort)
+			if err != nil {
+				return fmt.Errorf("failed to add check %q: %v", check.Name, err)
+			}
+			checks = append(checks, checkReg)
+		}
+	}
+
+	// Now add them to the registration queue
+	c.enqueueRegs(regs, checks, nil)
+	return nil
+}
+
 // RegisterTask with Consul. Adds all sevice entries and checks to Consul. If
 // exec is nil and a script check exists an error is returned.
 //
@@ -208,7 +286,7 @@ func (c *Client) RegisterTask(allocID string, task *structs.Task, exec ScriptExe
 	scriptChecks := map[string]*scriptCheck{}
 
 	for i, service := range task.Services {
-		id := makeServiceKey(allocID, task.Name, service)
+		id := makeTaskServiceID(allocID, task.Name, service)
 		host, port := task.FindHostAndPortFor(service.PortLabel)
 		serviceReg := &api.AgentServiceRegistration{
 			ID:      id,
@@ -240,7 +318,7 @@ func (c *Client) RegisterTask(allocID string, task *structs.Task, exec ScriptExe
 
 	}
 
-	// Now add them to the registration fields
+	// Now add them to the registration queue
 	c.enqueueRegs(regs, checks, scriptChecks)
 	return nil
 }
@@ -253,7 +331,7 @@ func (c *Client) RemoveTask(allocID string, task *structs.Task) {
 	checks := make([]string, 0, len(task.Services)*2) // just guess at size
 
 	for i, service := range task.Services {
-		id := makeServiceKey(allocID, task.Name, service)
+		id := makeTaskServiceID(allocID, task.Name, service)
 		deregs[i] = id
 
 		for _, check := range service.Checks {
@@ -280,7 +358,6 @@ func (c *Client) RemoveTask(allocID string, task *structs.Task) {
 
 func (c *Client) enqueueRegs(regs []*api.AgentServiceRegistration, checks []*api.AgentCheckRegistration, scriptChecks map[string]*scriptCheck) {
 	c.regLock.Lock()
-	defer c.regLock.Unlock()
 	for _, reg := range regs {
 		// Add reg
 		c.regServices[reg.ID] = reg
@@ -297,11 +374,13 @@ func (c *Client) enqueueRegs(regs []*api.AgentServiceRegistration, checks []*api
 	for checkID, check := range scriptChecks {
 		c.scriptChecks[checkID] = check.run()
 	}
+	c.regLock.Unlock()
+
+	c.forceSync()
 }
 
 func (c *Client) enqueueDeregs(deregs []string, checks []string) {
 	c.regLock.Lock()
-	defer c.regLock.Unlock()
 	for _, dereg := range deregs {
 		// Add dereg
 		c.deregServices[dereg] = mark
@@ -314,6 +393,9 @@ func (c *Client) enqueueDeregs(deregs []string, checks []string) {
 		// Make sure it's not being added
 		delete(c.regChecks, check)
 	}
+	c.regLock.Unlock()
+
+	c.forceSync()
 }
 
 func (c *Client) hasShutdown() bool {
@@ -325,15 +407,34 @@ func (c *Client) hasShutdown() bool {
 	}
 }
 
-// makeServiceKey creates a unique ID for identifying a service in Consul.
+// makeAgentServiceID creates a unique ID for identifying an agent service in
+// Consul.
 //
-// Service keys are of the form:
+// Agent service IDs are of the form:
+//
+//	{nomadServicePrefix}-{ROLE}-{Service.Name}-{Service.Tags...}
+//	Example Server ID: _nomad-server-nomad-serf
+//	Example Client ID: _nomad-client-nomad-client-http
+//
+func makeAgentServiceID(role string, service *structs.Service) string {
+	parts := make([]string, len(service.Tags)+3)
+	parts[0] = nomadServicePrefix
+	parts[1] = role
+	parts[2] = service.Name
+	copy(parts[3:], service.Tags)
+	return strings.Join(parts, "-")
+}
+
+// makeTaskServiceID creates a unique ID for identifying a task service in
+// Consul.
+//
+// Task service IDs are of the form:
 //
 //	{nomadServicePrefix}-executor-{ALLOC_ID}-{Service.Name}-{Service.Tags...}
-//	Example Service Key: _nomad-executor-1234-echo-http-tag1-tag2-tag3
+//	Example Service ID: _nomad-executor-1234-echo-http-tag1-tag2-tag3
 //
-func makeServiceKey(allocID, taskName string, service *structs.Service) string {
-	parts := make([]string, len(service.Tags)+3)
+func makeTaskServiceID(allocID, taskName string, service *structs.Service) string {
+	parts := make([]string, len(service.Tags)+5)
 	parts[0] = nomadServicePrefix
 	parts[1] = "executor"
 	parts[2] = allocID
