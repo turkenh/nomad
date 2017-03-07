@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
 )
@@ -31,8 +32,14 @@ type Client struct {
 	retryInterval time.Duration
 	syncInterval  time.Duration
 
+	// runningCh is closed when the main Run loop exits
+	runningCh chan struct{}
+
+	// shutdownCh is closed when the client should shutdown
 	shutdownCh chan struct{}
-	syncCh     chan struct{}
+
+	// syncCh triggers a sync in the main Run loop
+	syncCh chan struct{}
 
 	// services and checks to be registered
 	regServices map[string]*api.AgentServiceRegistration
@@ -47,9 +54,16 @@ type Client struct {
 
 	// regLock must be held while accessing reg and dereg maps
 	regLock sync.Mutex
+
+	// Registered agent services and checks
+	agentServices map[string]struct{}
+	agentChecks   map[string]struct{}
+
+	// agentLock must be held while accessing agent maps
+	agentLock sync.Mutex
 }
 
-func NewClient(consulConfig *config.ConsulConfig, shutdownCh chan struct{}, logger *log.Logger) (*Client, error) {
+func NewClient(consulConfig *config.ConsulConfig, logger *log.Logger) (*Client, error) {
 	apiConf, err := consulConfig.ApiConfig()
 	if err != nil {
 		return nil, err
@@ -63,17 +77,23 @@ func NewClient(consulConfig *config.ConsulConfig, shutdownCh chan struct{}, logg
 		logger:        logger,
 		retryInterval: defaultSyncInterval, //TODO what should this default to?!
 		syncInterval:  defaultSyncInterval,
-		shutdownCh:    shutdownCh,
+		runningCh:     make(chan struct{}),
+		shutdownCh:    make(chan struct{}),
 		syncCh:        make(chan struct{}, 1),
 		regServices:   make(map[string]*api.AgentServiceRegistration),
 		regChecks:     make(map[string]*api.AgentCheckRegistration),
 		deregServices: make(map[string]struct{}),
 		deregChecks:   make(map[string]struct{}),
 		scriptChecks:  make(map[string]func()),
+		agentServices: make(map[string]struct{}, 8),
+		agentChecks:   make(map[string]struct{}, 8),
 	}, nil
 }
 
+// Run the Consul main loop which performs registrations and deregistrations
+// against Consul. It should be called exactly once.
 func (c *Client) Run() {
+	defer close(c.runningCh)
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
@@ -223,6 +243,8 @@ func (c *Client) DiscoverServers(ctx context.Context, region, dc string) <-chan 
 
 // RegisterAgent registers Nomad agents (client or server). Script checks are
 // not supported and will return an error. Registration is asynchronous.
+//
+// Agents will be deregistered when Shutdown is called.
 func (c *Client) RegisterAgent(role string, services []*structs.Service) error {
 	regs := make([]*api.AgentServiceRegistration, len(services))
 	checks := make([]*api.AgentCheckRegistration, 0, len(services))
@@ -273,6 +295,16 @@ func (c *Client) RegisterAgent(role string, services []*structs.Service) error {
 
 	// Now add them to the registration queue
 	c.enqueueRegs(regs, checks, nil)
+
+	// Record IDs for deregistering on shutdown
+	c.agentLock.Lock()
+	for _, s := range regs {
+		c.agentServices[s.ID] = mark
+	}
+	for _, ch := range checks {
+		c.agentChecks[ch.ID] = mark
+	}
+	c.agentLock.Unlock()
 	return nil
 }
 
@@ -405,6 +437,45 @@ func (c *Client) hasShutdown() bool {
 	default:
 		return false
 	}
+}
+
+// Shutdown the Consul client. Deregister agent from Consul.
+func (c *Client) Shutdown() error {
+	if c.hasShutdown() {
+		return nil
+	}
+	close(c.shutdownCh)
+
+	var mErr multierror.Error
+
+	// Deregister agent services and checks
+	c.agentLock.Lock()
+	for id := range c.agentServices {
+		if err := c.client.Agent().ServiceDeregister(id); err != nil {
+			mErr.Errors = append(mErr.Errors, err)
+		}
+	}
+
+	// Deregister Checks
+	for id := range c.agentChecks {
+		if err := c.client.Agent().CheckDeregister(id); err != nil {
+			mErr.Errors = append(mErr.Errors, err)
+		}
+	}
+	c.agentLock.Unlock()
+
+	// Wait for Run to finish any outstanding sync() calls and exit
+	select {
+	case <-c.runningCh:
+		// sync one last time to ensure all enqueued operations are applied
+		if err := c.sync(); err != nil {
+			mErr.Errors = append(mErr.Errors, err)
+		}
+	case <-time.After(time.Minute):
+		// Don't wait forever though
+		c.logger.Printf("[WARN] consul: timed out waiting for Consul operations to complete")
+	}
+	return mErr.ErrorOrNil()
 }
 
 // makeAgentServiceID creates a unique ID for identifying an agent service in

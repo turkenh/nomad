@@ -189,8 +189,7 @@ func NewTaskRunner(logger *log.Logger, config *config.Config,
 	restartTracker := newRestartTracker(tg.RestartPolicy, alloc.Job.Type)
 
 	//TODO This should be injected not created
-	var shutdownCh chan struct{}
-	consulClient, err := consul.NewClient(config.ConsulConfig, shutdownCh, logger)
+	consulClient, err := consul.NewClient(config.ConsulConfig, logger)
 	if err != nil {
 		panic(err)
 	}
