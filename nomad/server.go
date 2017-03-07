@@ -63,6 +63,14 @@ const (
 	// raftRemoveGracePeriod is how long we wait to allow a RemovePeer
 	// to replicate to gracefully leave the cluster.
 	raftRemoveGracePeriod = 5 * time.Second
+
+	// defaultConsulDiscoveryInterval is how often to poll Consul for new
+	// servers if there is no leader.
+	defaultConsulDiscoveryInterval time.Duration = 9 * time.Second
+
+	// defaultConsulDiscoveryIntervalRetry is how often to poll Consul for
+	// new servers if there is no leader and the last Consul query failed.
+	defaultConsulDiscoveryIntervalRetry time.Duration = 3 * time.Second
 )
 
 // Server is Nomad server which manages the job queues,
@@ -614,7 +622,28 @@ func (s *Server) setupBootstrapHandler() error {
 		return nil
 	}
 
-	s.consulSyncer.AddPeriodicHandler("Nomad Server Fallback Server Handler", bootstrapFn)
+	// Hacky replacement for old ConsulSyncer Periodic Handler.
+	go func() {
+		lastOk := true
+		sync := time.NewTimer(0)
+		for {
+			select {
+			case <-sync.C:
+				d := defaultConsulDiscoveryInterval
+				if err := bootstrapFn(); err != nil {
+					// Only log if it worked last time
+					if lastOk {
+						lastOk = false
+						s.logger.Printf("[ERR] consul: error looking up Nomad servers: %v", err)
+					}
+					d = defaultConsulDiscoveryIntervalRetry
+				}
+				sync.Reset(d)
+			case <-s.shutdownCh:
+				return
+			}
+		}
+	}()
 	return nil
 }
 
