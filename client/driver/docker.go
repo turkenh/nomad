@@ -688,8 +688,8 @@ func (d *DockerDriver) createContainerConfig(ctx *ExecContext, task *structs.Tas
 	if driverConfig.WorkDir != "" {
 		config.WorkingDir = driverConfig.WorkDir
 	}
-
-	memLimit := int64(task.Resources.MemoryMB) * 1024 * 1024
+	// Disable memory limiting...
+	//memLimit := int64(task.Resources.MemoryMB) * 1024 * 1024
 
 	if len(driverConfig.Logging) == 0 {
 		if runtime.GOOS != "darwin" {
@@ -704,8 +704,9 @@ func (d *DockerDriver) createContainerConfig(ctx *ExecContext, task *structs.Tas
 
 	hostConfig := &docker.HostConfig{
 		// Convert MB to bytes. This is an absolute value.
-		Memory:     memLimit,
-		MemorySwap: memLimit, // MemorySwap is memory + swap.
+		// Disable memory limiting...
+		//Memory:     memLimit,
+		//MemorySwap: memLimit, // MemorySwap is memory + swap.
 		// Convert Mhz to shares. This is a relative value.
 		CPUShares: int64(task.Resources.CPU),
 
